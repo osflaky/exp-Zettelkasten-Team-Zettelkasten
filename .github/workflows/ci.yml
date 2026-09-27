@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-unix:
+    strategy:
+      fail-fast: false            # <— keep Linux running even if macOS fails
+      matrix:
+        include:
+        - os: windows-latest
+          arch: arm64
+          runner: windows-11-arm
+          expander_leg: windows-latest--arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@v7
+
+      # Linux: install Nix normally
+    - name: Install Nix (Linux)
+      if: runner.os == 'Linux'
+      uses: cachix/install-nix-action@v27
+      with:
+        extra_nix_config: |
+          experimental-features = nix-command flakes
+
+      # macOS: Java 8 directly
+    - name: Setup Java 8 (Zulu) on macOS
+      if: runner.os == 'macOS'
+      uses: actions/setup-java@v5
+      with:
+        distribution: zulu
+        java-version: '8'
+        cache: maven
+
+      # Write toolchains.xml to ~/.m2 (Maven default)
+    - name: Write toolchains.xml (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        mkdir -p "$HOME/.m2"
+        cat > "$HOME/.m2/toolchains.xml" <<EOF
+        <?xml version="1.0" encoding="UTF-8"?>
+        <toolchains>
+          <toolchain>
+            <type>jdk</type>
+            <provides>
+              <version>1.8</version>
+            </provides>
+            <configuration>
+              <jdkHome>${JAVA_HOME}</jdkHome>
+            </configuration>
+          </toolchain>
+        </toolchains>
+        EOF
+
+    - name: Cache Maven repo
+      if: runner.os != 'macOS'
+      uses: actions/cache@v6
+      with:
+        path: ~/.m2/repository
+        key: m2-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          m2-${{ runner.os }}-
+
+      # launch4j ships prebuilt x86-only windres/ld in its Linux workdir, which
+      # cannot execute on arm64 runners. Use native MinGW binutils instead
+      # (same tools launch4j expects) so the .exe is built on every Linux arch.
+    - name: Install MinGW binutils for launch4j (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y binutils-mingw-w64-i686
+        mkdir -p "$RUNNER_TEMP/launch4j-bin"
+        ln -sf "$(command -v i686-w64-mingw32-windres)" "$RUNNER_TEMP/launch4j-bin/windres"
+        ln -sf "$(command -v i686-w64-mingw32-ld)" "$RUNNER_TEMP/launch4j-bin/ld"
+        echo "LAUNCH4J_BINDIR=$RUNNER_TEMP/launch4j-bin" >> "$GITHUB_ENV"
+
+      # Optional: warm the dev shell so we see Nix errors early
+    - name: Warm Nix dev shell (Linux)
+      if: runner.os == 'Linux'
+      run: nix develop -L --accept-flake-config -c true
+
+    - name: Build (Linux via Nix dev shell)
+      if: runner.os == 'Linux'
+      timeout-minutes: 30
+      run: nix develop -L --accept-flake-config -c bash -lc 'mvn -B 
+        -Dlaunch4j.bindir="$LAUNCH4J_BINDIR" clean verify'
+
+    - name: Build (macOS without Nix)
+      if: runner.os == 'macOS'
+      env:
+        MAVEN_OPTS: -Djava.awt.headless=true
+      run: mvn -B clean verify
+
+    - name: Package macOS app
+      if: runner.os == 'macOS'
+      run: mvn -B -Pmac -DskipTests -Dmacosappbundler.dmg.enabled=false package
+
+    - name: Create distributable ZIP
+      if: runner.os == 'macOS'
+      run: |
+        cd target
+        ditto -c -k --sequesterRsrc --keepParent "Zettelkasten.app" "Zettelkasten-macOS.zip"
+
+    name: build-unix [${{ matrix.expander_leg }}]
+    timeout-minutes: 150
